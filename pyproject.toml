@@ -32,6 +32,7 @@ tests = [
     "pytest-rerunfailures>=14",
     "pytest-xdist>=3",
     "ruff>=0.12",
+    "ty>=0.0.66",
 ]
 
 [build-system]
@@ -41,6 +42,22 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ty.environment]
+python-version = "3.13"
+python-platform = "all"
+root = ["./src"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.ty.rules]
+blanket-ignore-comment = "error"
+ignore-comment-unknown-rule = "error"
+missing-type-argument = "error"
+possibly-unresolved-reference = "warn"
+unused-ignore-comment = "error"
+unused-type-ignore-comment = "error"
 
 [tool.ruff]
 target-version = "py313"

@@ -7,7 +7,7 @@ import csv
 import logging
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from tqdm.asyncio import tqdm_asyncio
 
@@ -109,6 +109,8 @@ class AsyncBatchRunner:
 
     def _create_csv_headers(self) -> None:
         """Create the CSV file with headers."""
+        if self.results_file_path is None:
+            return
         if not self.results_file_path.parent.is_dir():
             self.results_file_path.parent.mkdir(parents=True)
         with self.results_file_path.open("w") as csvfile:
@@ -124,6 +126,8 @@ class AsyncBatchRunner:
 
     def _expand_results_file_headers(self) -> None:
         """Add inferred dictionary columns while preserving previous failed rows."""
+        if self.results_file_path is None:
+            return
         temporary_results_file_path = self.results_file_path.with_suffix(
             f"{self.results_file_path.suffix}.tmp"
         )
@@ -175,6 +179,9 @@ class AsyncBatchRunner:
         :raises ValueError: If a dictionary cannot establish or does not match the
             inferred column schema.
         """
+        if self.results_file_path is None:
+            return
+
         # Format timestamps
         start_time_str = datetime.fromtimestamp(start_time, tz=UTC).isoformat()
         end_time_str = datetime.fromtimestamp(end_time, tz=UTC).isoformat()
@@ -191,8 +198,9 @@ class AsyncBatchRunner:
                 if not all(isinstance(column_name, str) for column_name in result):
                     message = "Dictionary results must only use string keys"
                     raise TypeError(message)
+                dictionary_result = cast("dict[str, Any]", result)
                 reserved_column_names_in_result = (
-                    set(result) & RESULTS_FILE_RESERVED_DICTIONARY_KEYS
+                    set(dictionary_result) & RESULTS_FILE_RESERVED_DICTIONARY_KEYS
                 )
                 if reserved_column_names_in_result:
                     names = ", ".join(sorted(reserved_column_names_in_result))
@@ -200,7 +208,7 @@ class AsyncBatchRunner:
                     raise ValueError(message)
 
                 # Infer every result column from the first successful dictionary.
-                returned_dictionary_result_columns = tuple(result)
+                returned_dictionary_result_columns = tuple(dictionary_result)
                 if self._returns_dictionary_results is None:
                     # This is the first successful return, so its key order permanently
                     # defines the dictionary columns for this results file.
@@ -282,7 +290,7 @@ class AsyncBatchRunner:
     async def call(
         self,
         func: Callable[..., Awaitable[T]],
-        task_id: str | None = None,
+        task_id: str,
         *,
         _first_task_exception_future: asyncio.Future[Exception] | None = None,
         **kwargs,
@@ -311,9 +319,9 @@ class AsyncBatchRunner:
             error_msg = None
             result = None
             success = False
+            start_time = time.time()
 
             try:
-                start_time = time.time()
                 result = await func(**kwargs)
                 success = True
                 return result
@@ -543,8 +551,10 @@ class AsyncBatchRunner:
         # Write rows with success or failed without success
         with csv_path.open() as csvfile:
             reader = csv.DictReader(csvfile)
+            if (fieldnames := reader.fieldnames) is None:
+                return
             with temp_path.open("w") as tmp_file:
-                writer = csv.DictWriter(tmp_file, fieldnames=reader.fieldnames)
+                writer = csv.DictWriter(tmp_file, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in reader:
                     # Write success rows and failed one with no success (same task_id)
