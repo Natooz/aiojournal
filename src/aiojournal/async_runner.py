@@ -27,20 +27,25 @@ T = TypeVar("T")  # Return type for the callable
 MAX_CONCURRENCY = 100
 
 
+# TODO make possible to subclass it and add a run abstract method called instead of
+#  provided func callable
+# TODO save custom rows in csv (returned dictionary from executed function)
+# TODO raise on failure option
 class AsyncBatchRunner:
     """A simple async runner that limits the number of concurrent function calls."""
 
     def __init__(
-        self, max_concurrency: int = MAX_CONCURRENCY, csv_path: Path | None = None
+        self,
+        max_concurrency: int = MAX_CONCURRENCY,
+        results_file_path: Path | None = None,
     ) -> None:
         """
-        Initialize the async pool with a maximum concurrency limit.
+        Initialize the runner and its concurrency limit.
 
-        Args:
-        ----
-            max_concurrency: Maximum number of concurrent function calls allowed
-            csv_path: Path to the CSV file where results will be saved
-
+        :param max_concurrency: Maximum number of concurrent function calls.
+        :param results_file_path: File where task results are appended, or ``None`` to
+            disable journaling.
+        :raises ValueError: If ``max_concurrency`` is less than one.
         """
         if max_concurrency < 1:
             raise ValueError(_ := "max_concurrency must be at least 1")
@@ -48,14 +53,14 @@ class AsyncBatchRunner:
         self.max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self._tasks = set()
-        self.csv_path = csv_path
+        self.results_file_path = results_file_path
         self.csv_lock = asyncio.Lock()  # Lock to prevent concurrent writes to CSV
 
     def _create_csv_headers(self) -> None:
         """Create the CSV file with headers."""
-        if not self.csv_path.parent.is_dir():
-            self.csv_path.parent.mkdir(parents=True)
-        with self.csv_path.open("w") as csvfile:
+        if not self.results_file_path.parent.is_dir():
+            self.results_file_path.parent.mkdir(parents=True)
+        with self.results_file_path.open("w") as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(
                 [
@@ -79,17 +84,14 @@ class AsyncBatchRunner:
         error: str | None = None,
     ) -> None:
         """
-        Save a function call result to the CSV file.
+        Append a function-call result to the CSV journal.
 
-        Args:
-        ----
-            task_id: Unique identifier for the task
-            start_time: Timestamp when the task started
-            end_time: Timestamp when the task ended
-            success: Whether the task completed successfully
-            result: Result of the function call (will be converted to string)
-            error: Error message if the task failed
-
+        :param task_id: Identifier of the task.
+        :param start_time: Unix timestamp recorded when the task started.
+        :param end_time: Unix timestamp recorded when the task ended.
+        :param success: Whether the task completed successfully.
+        :param result: Task result, converted to a string before writing.
+        :param error: Error message when the task failed.
         """
         # Format timestamps
         start_time_str = datetime.fromtimestamp(start_time, tz=UTC).isoformat()
@@ -98,9 +100,9 @@ class AsyncBatchRunner:
 
         # Ensure only one task writes to the CSV at a time
         async with self.csv_lock:
-            if not self.csv_path.is_file():
+            if not self.results_file_path.is_file():
                 self._create_csv_headers()
-            with self.csv_path.open("a") as csvfile:
+            with self.results_file_path.open("a") as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(
                     [
@@ -118,54 +120,47 @@ class AsyncBatchRunner:
         self, func: Callable[..., Awaitable[T]], task_id: str | None = None, **kwargs
     ) -> T:
         """
-        Execute a function with the given arguments, respecting the concurrency limit.
+        Execute an async callable within the configured concurrency limit.
 
-        Save the result to CSV file.
+        When a results file is configured, the attempt is appended to its CSV journal.
 
-        Args:
-        ----
-            func: Async callable to execute
-            task_id: Optional identifier for the task (auto-generated if None)
-            **kwargs: Arguments to pass to the function
-
-        Returns:
-        -------
-            The result of the function call
-
+        :param func: Async callable to execute.
+        :param task_id: Identifier written to the CSV journal.
+        :param kwargs: Keyword arguments passed to ``func``.
+        :return: The callable's result.
+        :raises Exception: Any exception raised by ``func``.
         """
-        start_time = None
-        error_msg = None
-        result = None
-        success = False
+        # Start timing only after a concurrency slot is available.
+        async with self.semaphore:
+            error_msg = None
+            result = None
+            success = False
 
-        try:
-            # Acquire semaphore before executing
-            async with self.semaphore:
+            try:
                 start_time = time.time()
                 result = await func(**kwargs)
                 success = True
                 return result
 
-        except Exception as e:
-            error_msg = str(e)
-            logger.info(
-                _ := f"{task_id} - Task failed: {error_msg}",
-                extra={"task_id": task_id, "error": error_msg},
-            )
-            raise
-
-        finally:
-            end_time = time.time()
-            # Save result to CSV
-            if self.csv_path is not None:
-                await self._save_to_csv(
-                    task_id=task_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                    success=success,
-                    result=result,
-                    error=error_msg,
+            except Exception as exception:
+                error_msg = str(exception)
+                logger.info(
+                    _ := f"{task_id} - Task failed: {error_msg}",
+                    extra={"task_id": task_id, "error": error_msg},
                 )
+                raise
+
+            finally:
+                # Save result to CSV
+                if self.results_file_path is not None:
+                    await self._save_to_csv(
+                        task_id=task_id,
+                        start_time=start_time,
+                        end_time=time.time(),
+                        success=success,
+                        result=result,
+                        error=error_msg,
+                    )
 
     async def gather(
         self,
@@ -174,21 +169,16 @@ class AsyncBatchRunner:
         progress_bar_desc: str | None = None,
     ) -> list[Any]:
         """
-        Execute multiple functions with their arguments concurrently.
+        Execute multiple functions concurrently.
 
-        Args:
-        ----
-            funcs_with_args: List of dictionaries, each containing:
-                - 'func': the async callable
-                - any other key-value pairs are passed as arguments to the function
-            task_ids: List of task IDs
-            progress_bar_desc: Description for the progress bar. Leave ``None`` for no
-                progress bar. (default: None)
-
-        Returns:
-        -------
-            List of results in the same order as the input functions
-
+        :param funcs_with_args: Call specifications containing a ``func`` entry and
+            keyword arguments for that callable.
+        :param task_ids: Task identifiers corresponding to ``funcs_with_args``.
+        :param progress_bar_desc: Progress-bar description, or ``None`` to disable the
+            progress bar.
+        :return: Results or exceptions in the same order as ``funcs_with_args``.
+        :raises ValueError: If the number of task IDs does not match the number of call
+            specifications.
         """
         if not funcs_with_args:
             return []
@@ -200,7 +190,7 @@ class AsyncBatchRunner:
 
         # Create tasks and start them immediately
         tasks = []
-        for item, task_id in zip(funcs_with_args, task_ids, strict=False):
+        for item, task_id in zip(funcs_with_args, task_ids, strict=True):
             item_copy = item.copy()
             func = item_copy.pop("func")
             # Create a task that will call the function with semaphore management
@@ -227,7 +217,15 @@ class AsyncBatchRunner:
         return_exceptions: bool = False,
         **kwargs,
     ) -> list[T | BaseException]:
-        """Wrap ``tqdm_asyncio.gather`` to supports ``return_exceptions``."""
+        """
+        Gather awaitables with progress and optional exception results.
+
+        :param fs: Awaitables to execute.
+        :param return_exceptions: Return exceptions alongside successful results when
+            ``True``.
+        :param kwargs: Keyword arguments passed to ``tqdm_asyncio.gather``.
+        :return: Results in the same order as ``fs``.
+        """
         if not return_exceptions:
             return await tqdm_asyncio.gather(*fs, **kwargs)
 
@@ -245,53 +243,49 @@ class AsyncBatchRunner:
         args_list: list[dict[str, Any]],
         task_ids: list[str],
         progress_bar_desc: str | None = None,
-    ) -> list[T]:
+    ) -> list[T | BaseException]:
         """
-        Apply the same function to multiple sets of arguments concurrently.
+        Apply one async callable to multiple argument sets concurrently.
 
-        Args:
-            func: Async callable to execute
-            args_list: List of argument dictionaries to pass to the function
-            task_ids: Optional list of task IDs (auto-generated if None)
-            progress_bar_desc: Description for the progress bar. Leave ``None`` for no
-                progress bar. (default: None)
-
-        Returns:
-            List of results in the same order as the input arguments
-
+        :param func: Async callable to execute.
+        :param args_list: Keyword-argument dictionaries passed to ``func``.
+        :param task_ids: Task identifiers corresponding to ``args_list``.
+        :param progress_bar_desc: Progress-bar description, or ``None`` to disable the
+            progress bar.
+        :return: Results or exceptions in the same order as ``args_list``.
+        :raises ValueError: If the number of task IDs does not match the number of
+            argument sets.
         """
         funcs_with_args = [{"func": func, **args} for args in args_list]
         return await self.gather(funcs_with_args, task_ids, progress_bar_desc)
 
-    def get_active_count(self) -> int:
-        """Get the number of currently running tasks."""
+    @property
+    def num_active_count(self) -> int:
+        """
+        Return the number of currently active calls.
+
+        :return: Number of acquired concurrency slots.
+        """
         return self.max_concurrency - self.semaphore._value
 
     def read_results_csv(
-        self, csv_path: str | None = None, as_dict: bool = False
-    ) -> Generator[dict[str, str]] | Generator[tuple[str, dict[str, str]]]:
+        self, csv_path: Path | None = None
+    ) -> Generator[dict[str, str]]:
         """
         Read the results CSV file, yielding one row at a time.
 
-        :param csv_path: Path to the CSV file
-        :param as_dict: if ``True``, yield ``(task_id, row)`` tuples instead of row
-            dicts. (default: ``False``)
-        :return: Generator yielding rows from the CSV
+        :param csv_path: CSV file to read, or ``None`` to use the configured journal.
+        :return: Rows from the CSV journal.
         """
         if csv_path is None:
-            csv_path = self.csv_path
+            csv_path = self.results_file_path
 
-        if not csv_path.is_file():
+        if csv_path is None or not csv_path.is_file():
             return
 
         with csv_path.open() as csvfile:
             reader = csv.DictReader(csvfile)
-            for row in reader:
-                if not as_dict:
-                    yield row
-                else:
-                    row_id = row.pop("task_id")
-                    yield row_id, row
+            yield from reader
 
     def remove_tasks_failed_from_res_file(
         self, remove_only_those_succeeded: bool = True
@@ -305,12 +299,11 @@ class AsyncBatchRunner:
         :param remove_only_those_succeeded: If ``True``, only remove rows that failed
             for which another row with the same task_id is succeeded. This allows to
             clean multi-attempt failures while keeping failures with no success.
-            (default: ``True``)
         """
-        if self.csv_path is None or not self.csv_path.is_file():
+        if self.results_file_path is None or not self.results_file_path.is_file():
             return
 
-        csv_path = self.csv_path
+        csv_path = self.results_file_path
         temp_path = csv_path.with_suffix(f"{csv_path.suffix}.tmp")
 
         # First get ids of requests succeeded
