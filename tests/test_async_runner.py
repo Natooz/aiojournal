@@ -98,6 +98,93 @@ async def test_raise_on_failure_finishes_active_calls_and_skips_queued(
     assert completed_task_names == ["active"]
 
 
+async def test_dictionary_results_infer_columns_after_persisted_failures(
+    tmp_path: Path,
+) -> None:
+    failure_message = "failed before schema inference"
+    results_file_path = tmp_path / "results.csv"
+
+    async def fail() -> None:
+        raise RuntimeError(failure_message)
+
+    runner = AsyncBatchRunner(
+        max_concurrency=1,
+        results_file_path=results_file_path,
+    )
+    await runner.gather([{"func": fail}], task_ids=["failure"])
+
+    # Reopening a file containing only failures must leave its schema unresolved.
+    runner = AsyncBatchRunner(
+        max_concurrency=1,
+        results_file_path=results_file_path,
+    )
+
+    async def build_result(value: int) -> dict[str, int | str]:
+        result = {"result": value * 2, "category": f"value-{value}"}
+        if value == 1:
+            result["optional_score"] = 10
+        return result
+
+    await runner.map(
+        build_result,
+        args_list=[{"value": 1}, {"value": 2}],
+        task_ids=["first", "second"],
+    )
+    recorded_results_by_task_id = {
+        result["task_id"]: result for result in runner.read_results_csv()
+    }
+
+    assert list(recorded_results_by_task_id["first"]) == [
+        "task_id",
+        "start_time",
+        "end_time",
+        "duration_seconds",
+        "success",
+        "error",
+        "result",
+        "category",
+        "optional_score",
+    ]
+    assert recorded_results_by_task_id["failure"]["category"] == ""
+    assert recorded_results_by_task_id["failure"]["optional_score"] == ""
+    assert recorded_results_by_task_id["first"]["result"] == "2"
+    assert recorded_results_by_task_id["first"]["category"] == "value-1"
+    assert recorded_results_by_task_id["first"]["optional_score"] == "10"
+    assert recorded_results_by_task_id["second"]["result"] == "4"
+    assert recorded_results_by_task_id["second"]["optional_score"] == ""
+
+
+async def test_results_file_enforces_inferred_return_format(tmp_path: Path) -> None:
+    async def scalar_result() -> str:
+        return "scalar"
+
+    async def dictionary_result() -> dict[str, str]:
+        return {"result": "primary"}
+
+    scalar_runner = AsyncBatchRunner(results_file_path=tmp_path / "scalar.csv")
+    await scalar_runner.call(scalar_result, task_id="scalar")
+    with pytest.raises(TypeError, match="Expected a scalar result"):
+        await scalar_runner.call(dictionary_result, task_id="dictionary")
+
+    dictionary_results_file_path = tmp_path / "dictionary.csv"
+    dictionary_runner = AsyncBatchRunner(results_file_path=dictionary_results_file_path)
+    await dictionary_runner.call(dictionary_result, task_id="dictionary")
+
+    # The custom schema must also be enforced after reopening the results file.
+    dictionary_runner = AsyncBatchRunner(results_file_path=dictionary_results_file_path)
+    with pytest.raises(TypeError, match="Expected a dictionary result"):
+        await dictionary_runner.call(scalar_result, task_id="scalar")
+
+    async def dictionary_result_with_extra_column() -> dict[str, str]:
+        return {"result": "primary", "extra": "unexpected"}
+
+    with pytest.raises(ValueError, match="unexpected columns: extra"):
+        await dictionary_runner.call(
+            dictionary_result_with_extra_column,
+            task_id="extra-column",
+        )
+
+
 async def test_failed_attempt_cleanup_keeps_successes_and_unresolved_failures(
     tmp_path: Path,
 ) -> None:

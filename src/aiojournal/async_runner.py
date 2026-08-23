@@ -26,10 +26,28 @@ T = TypeVar("T")  # Return type for the callable
 
 MAX_CONCURRENCY = 100
 
+# Scalar and dictionary files deliberately place ``error`` differently. The header
+# order determines the return format
+RESULTS_FILE_COMMON_COLUMNS = (
+    "task_id",
+    "start_time",
+    "end_time",
+    "duration_seconds",
+    "success",
+)
+RESULTS_FILE_SCALAR_COLUMNS = (
+    *RESULTS_FILE_COMMON_COLUMNS,
+    "result",
+    "error",
+)
+RESULTS_FILE_DICTIONARY_METADATA_COLUMNS = (*RESULTS_FILE_COMMON_COLUMNS, "error")
+RESULTS_FILE_RESERVED_DICTIONARY_KEYS = frozenset(
+    RESULTS_FILE_DICTIONARY_METADATA_COLUMNS
+)
+
 
 # TODO make possible to subclass it and add a run abstract method called instead of
 #  provided func callable
-# TODO save custom rows in csv (returned dictionary from executed function)
 class AsyncBatchRunner:
     """A simple async runner that limits the number of concurrent function calls."""
 
@@ -44,7 +62,8 @@ class AsyncBatchRunner:
         :param max_concurrency: Maximum number of concurrent function calls.
         :param results_file_path: File where task results are appended, or ``None`` to
             disable journaling.
-        :raises ValueError: If ``max_concurrency`` is less than one.
+        :raises ValueError: If ``max_concurrency`` is less than one or an existing
+            results file has an incompatible header.
         """
         if max_concurrency < 1:
             raise ValueError(_ := "max_concurrency must be at least 1")
@@ -54,6 +73,39 @@ class AsyncBatchRunner:
         self._tasks = set()
         self.results_file_path = results_file_path
         self.csv_lock = asyncio.Lock()  # Lock to prevent concurrent writes to CSV
+        self._returns_dictionary_results: bool | None = None
+        self._dictionary_result_columns: tuple[str, ...] = ()
+
+        # Restore the return format fixed by an existing results file. A file containing
+        # only failed rows has not established its return format yet.
+        if (
+            results_file_path is not None
+            and results_file_path.is_file()
+            and results_file_path.stat().st_size > 0
+        ):
+            with results_file_path.open(newline="") as results_file:
+                reader = csv.DictReader(results_file)
+                if reader.fieldnames is not None:
+                    # Scalar and dictionary files use different column ordering so a
+                    # dictionary containing only "result" remains distinguishable.
+                    if reader.fieldnames == list(RESULTS_FILE_SCALAR_COLUMNS):
+                        # Adding success condition here as previous run might only have
+                        # save failed tasks, which use the scalar format. In that case
+                        # the returned format is still not determined.
+                        if any(row["success"] == "True" for row in reader):
+                            self._returns_dictionary_results = False
+                    elif reader.fieldnames[
+                        : len(RESULTS_FILE_DICTIONARY_METADATA_COLUMNS)
+                    ] == list(RESULTS_FILE_DICTIONARY_METADATA_COLUMNS):
+                        self._returns_dictionary_results = True
+                        self._dictionary_result_columns = tuple(
+                            reader.fieldnames[
+                                len(RESULTS_FILE_DICTIONARY_METADATA_COLUMNS) :
+                            ]
+                        )
+                    else:
+                        message = "Existing results file has an incompatible CSV header"
+                        raise ValueError(message)
 
     def _create_csv_headers(self) -> None:
         """Create the CSV file with headers."""
@@ -63,15 +115,42 @@ class AsyncBatchRunner:
             writer = csv.writer(csvfile)
             writer.writerow(
                 [
-                    "task_id",
-                    "start_time",
-                    "end_time",
-                    "duration_seconds",
-                    "success",
-                    "result",
-                    "error",
+                    *RESULTS_FILE_DICTIONARY_METADATA_COLUMNS,
+                    *self._dictionary_result_columns,
                 ]
+                if self._returns_dictionary_results
+                else RESULTS_FILE_SCALAR_COLUMNS
             )
+
+    def _expand_results_file_headers(self) -> None:
+        """Add inferred dictionary columns while preserving previous failed rows."""
+        temporary_results_file_path = self.results_file_path.with_suffix(
+            f"{self.results_file_path.suffix}.tmp"
+        )
+
+        with self.results_file_path.open(newline="") as results_file:
+            reader = csv.DictReader(results_file)
+            with temporary_results_file_path.open("w", newline="") as temporary_file:
+                writer = csv.DictWriter(
+                    temporary_file,
+                    fieldnames=[
+                        *RESULTS_FILE_DICTIONARY_METADATA_COLUMNS,
+                        *self._dictionary_result_columns,
+                    ],
+                )
+                writer.writeheader()
+
+                # Existing rows are failures written before the return format was known.
+                # Copy their shared metadata and leave inferred result columns empty.
+                for row in reader:
+                    writer.writerow(
+                        {
+                            column_name: row.get(column_name, "")
+                            for column_name in writer.fieldnames
+                        }
+                    )
+
+        temporary_results_file_path.replace(self.results_file_path)
 
     async def _save_to_csv(
         self,
@@ -89,8 +168,12 @@ class AsyncBatchRunner:
         :param start_time: Unix timestamp recorded when the task started.
         :param end_time: Unix timestamp recorded when the task ended.
         :param success: Whether the task completed successfully.
-        :param result: Task result, converted to a string before writing.
+        :param result: Scalar task result or dictionary of result-column values.
         :param error: Error message when the task failed.
+        :raises TypeError: If a successful result does not match the established return
+            format or contains a non-string dictionary key.
+        :raises ValueError: If a dictionary cannot establish or does not match the
+            inferred column schema.
         """
         # Format timestamps
         start_time_str = datetime.fromtimestamp(start_time, tz=UTC).isoformat()
@@ -99,21 +182,102 @@ class AsyncBatchRunner:
 
         # Ensure only one task writes to the CSV at a time
         async with self.csv_lock:
-            if not self.results_file_path.is_file():
-                self._create_csv_headers()
-            with self.results_file_path.open("a") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(
-                    [
-                        task_id,
-                        start_time_str,
-                        end_time_str,
-                        f"{duration:.4f}",
-                        success,
-                        str(result) if result is not None else "",
-                        error or "",
-                    ]
+            result_is_dictionary = isinstance(result, dict)
+
+            # Check every successful result. The first fixes the scalar or dictionary
+            # format; later results must keep that type and cannot add columns.
+            if success and result_is_dictionary:
+                # Validate column names
+                if not all(isinstance(column_name, str) for column_name in result):
+                    message = "Dictionary results must only use string keys"
+                    raise TypeError(message)
+                reserved_column_names_in_result = (
+                    set(result) & RESULTS_FILE_RESERVED_DICTIONARY_KEYS
                 )
+                if reserved_column_names_in_result:
+                    names = ", ".join(sorted(reserved_column_names_in_result))
+                    message = f"Dictionary result uses reserved columns: {names}"
+                    raise ValueError(message)
+
+                # Infer every result column from the first successful dictionary.
+                returned_dictionary_result_columns = tuple(result)
+                if self._returns_dictionary_results is None:
+                    # This is the first successful return, so its key order permanently
+                    # defines the dictionary columns for this results file.
+                    self._returns_dictionary_results = True
+                    self._dictionary_result_columns = returned_dictionary_result_columns
+                    # If result file already existed, because of previous failed tasks,
+                    # rewrite it with the now determined columns names
+                    if (
+                        self.results_file_path.is_file()
+                        and self.results_file_path.stat().st_size > 0
+                    ):
+                        self._expand_results_file_headers()
+                elif not self._returns_dictionary_results:
+                    message = "Expected a scalar result, received a dictionary"
+                    raise TypeError(message)
+
+                # Once inferred, later dictionaries may omit columns but cannot add any.
+                unexpected_result_columns = set(
+                    returned_dictionary_result_columns
+                ) - set(self._dictionary_result_columns)
+                if unexpected_result_columns:
+                    names = ", ".join(sorted(unexpected_result_columns))
+                    message = f"Dictionary result contains unexpected columns: {names}"
+                    raise ValueError(message)
+
+            # Scalar result format
+            elif success:
+                if self._returns_dictionary_results:
+                    message = "Expected a dictionary result, received a scalar"
+                    raise TypeError(message)
+                self._returns_dictionary_results = False
+
+            # Create the file after a successful result has had a chance to infer its
+            # columns. Failed tasks create the unresolved scalar-style header.
+            if (
+                not self.results_file_path.is_file()
+                or self.results_file_path.stat().st_size == 0
+            ):
+                self._create_csv_headers()
+
+            # Project dictionary values onto the inferred columns. Missing keys and
+            # failed-task dictionary values become empty CSV cells.
+            dictionary_result_values = (
+                [
+                    result.get(column_name, "")
+                    for column_name in self._dictionary_result_columns
+                ]
+                if result_is_dictionary
+                else [""] * len(self._dictionary_result_columns)
+            )
+
+            # Append one complete task record using the established column order.
+            with self.results_file_path.open("a", newline="") as csvfile:
+                writer = csv.writer(csvfile)
+                task_metadata = [
+                    task_id,
+                    start_time_str,
+                    end_time_str,
+                    f"{duration:.4f}",
+                    success,
+                ]
+                if self._returns_dictionary_results:
+                    # Dictionary files store error metadata first, followed by values in
+                    # the exact order established by the first dictionary result.
+                    writer.writerow(
+                        [*task_metadata, error or "", *dictionary_result_values]
+                    )
+                else:
+                    # Scalar and unresolved failure rows keep the standard result column
+                    # immediately before the error column.
+                    writer.writerow(
+                        [
+                            *task_metadata,
+                            str(result) if result is not None else "",
+                            error or "",
+                        ]
+                    )
 
     async def call(
         self,
@@ -170,14 +334,25 @@ class AsyncBatchRunner:
             finally:
                 # Save result to CSV
                 if self.results_file_path is not None:
-                    await self._save_to_csv(
-                        task_id=task_id,
-                        start_time=start_time,
-                        end_time=time.time(),
-                        success=success,
-                        result=result,
-                        error=error_msg,
-                    )
+                    # Saving can fail if the result has the wrong type or dictionary
+                    # keys, or if the file cannot be written. Signal that failure before
+                    # releasing the semaphore so queued calls do not start.
+                    try:
+                        await self._save_to_csv(
+                            task_id=task_id,
+                            start_time=start_time,
+                            end_time=time.time(),
+                            success=success,
+                            result=result,
+                            error=error_msg,
+                        )
+                    except Exception as exception:
+                        if (
+                            _first_task_exception_future is not None
+                            and not _first_task_exception_future.done()
+                        ):
+                            _first_task_exception_future.set_result(exception)
+                        raise
 
     async def gather(
         self,
