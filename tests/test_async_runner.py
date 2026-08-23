@@ -57,6 +57,47 @@ async def test_gather_returns_exceptions_and_records_results(tmp_path: Path) -> 
     assert recorded_results_by_task_id["failure"]["error"] == failure_message
 
 
+@pytest.mark.parametrize("progress_bar_desc", [None, "test batch"])
+async def test_raise_on_failure_finishes_active_calls_and_skips_queued(
+    progress_bar_desc: str | None,
+) -> None:
+    failure_message = "failed on purpose"
+    active_call_started = asyncio.Event()
+    failure_triggered = asyncio.Event()
+    started_task_names = []
+    completed_task_names = []
+
+    async def execute(task_name: str) -> str:
+        started_task_names.append(task_name)
+
+        if task_name == "failure":
+            await active_call_started.wait()
+            failure_triggered.set()
+            raise ValueError(failure_message)
+
+        if task_name == "active":
+            active_call_started.set()
+            await failure_triggered.wait()
+            completed_task_names.append(task_name)
+
+        return task_name
+
+    task_names = ["failure", "active", "queued"]
+    runner = AsyncBatchRunner(max_concurrency=2)
+
+    with pytest.raises(ValueError, match=failure_message):
+        await runner.map(
+            execute,
+            args_list=[{"task_name": task_name} for task_name in task_names],
+            task_ids=task_names,
+            progress_bar_desc=progress_bar_desc,
+            raise_on_failure=True,
+        )
+
+    assert started_task_names == ["failure", "active"]
+    assert completed_task_names == ["active"]
+
+
 async def test_failed_attempt_cleanup_keeps_successes_and_unresolved_failures(
     tmp_path: Path,
 ) -> None:

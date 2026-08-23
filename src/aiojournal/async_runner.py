@@ -30,7 +30,6 @@ MAX_CONCURRENCY = 100
 # TODO make possible to subclass it and add a run abstract method called instead of
 #  provided func callable
 # TODO save custom rows in csv (returned dictionary from executed function)
-# TODO raise on failure option
 class AsyncBatchRunner:
     """A simple async runner that limits the number of concurrent function calls."""
 
@@ -117,7 +116,12 @@ class AsyncBatchRunner:
                 )
 
     async def call(
-        self, func: Callable[..., Awaitable[T]], task_id: str | None = None, **kwargs
+        self,
+        func: Callable[..., Awaitable[T]],
+        task_id: str | None = None,
+        *,
+        _first_task_exception_future: asyncio.Future[Exception] | None = None,
+        **kwargs,
     ) -> T:
         """
         Execute an async callable within the configured concurrency limit.
@@ -126,12 +130,20 @@ class AsyncBatchRunner:
 
         :param func: Async callable to execute.
         :param task_id: Identifier written to the CSV journal.
+        :param _first_task_exception_future: Internal batch signal containing the first
+            task exception.
         :param kwargs: Keyword arguments passed to ``func``.
         :return: The callable's result.
         :raises Exception: Any exception raised by ``func``.
         """
         # Start timing only after a concurrency slot is available.
         async with self.semaphore:
+            if (
+                _first_task_exception_future is not None
+                and _first_task_exception_future.done()
+            ):
+                raise asyncio.CancelledError
+
             error_msg = None
             result = None
             success = False
@@ -143,6 +155,11 @@ class AsyncBatchRunner:
                 return result
 
             except Exception as exception:
+                if (
+                    _first_task_exception_future is not None
+                    and not _first_task_exception_future.done()
+                ):
+                    _first_task_exception_future.set_result(exception)
                 error_msg = str(exception)
                 logger.info(
                     _ := f"{task_id} - Task failed: {error_msg}",
@@ -167,6 +184,8 @@ class AsyncBatchRunner:
         funcs_with_args: list[dict[str, Any]],
         task_ids: list[str],
         progress_bar_desc: str | None = None,
+        *,
+        raise_on_failure: bool = False,
     ) -> list[Any]:
         """
         Execute multiple functions concurrently.
@@ -176,6 +195,8 @@ class AsyncBatchRunner:
         :param task_ids: Task identifiers corresponding to ``funcs_with_args``.
         :param progress_bar_desc: Progress-bar description, or ``None`` to disable the
             progress bar.
+        :param raise_on_failure: Stop queued calls after the first task exception, wait
+            for active calls to finish, and then raise that exception.
         :return: Results or exceptions in the same order as ``funcs_with_args``.
         :raises ValueError: If the number of task IDs does not match the number of call
             specifications.
@@ -188,13 +209,24 @@ class AsyncBatchRunner:
                 _ := "Length of task_ids must match length of funcs_with_args"
             )
 
+        first_task_exception_future: asyncio.Future[Exception] | None = (
+            asyncio.get_running_loop().create_future() if raise_on_failure else None
+        )
+
         # Create tasks and start them immediately
         tasks = []
         for item, task_id in zip(funcs_with_args, task_ids, strict=True):
             item_copy = item.copy()
             func = item_copy.pop("func")
             # Create a task that will call the function with semaphore management
-            task = asyncio.create_task(self.call(func, task_id=task_id, **item_copy))
+            task = asyncio.create_task(
+                self.call(
+                    func,
+                    task_id=task_id,
+                    _first_task_exception_future=first_task_exception_future,
+                    **item_copy,
+                )
+            )
             tasks.append(task)
 
         # Execute with or without progress bar
@@ -208,6 +240,13 @@ class AsyncBatchRunner:
         # Remove completed tasks
         for task in tasks:
             self._tasks.discard(task)
+
+        if first_task_exception_future is not None:
+            if first_task_exception_future.done():
+                raise first_task_exception_future.result()
+            for task in tasks:
+                if task_exception := task.exception():
+                    raise task_exception
 
         return results
 
@@ -232,8 +271,8 @@ class AsyncBatchRunner:
         async def wrap(f: Awaitable[T]) -> T | BaseException:
             try:
                 return await f
-            except Exception as e:  # noqa:BLE001
-                return e
+            except (Exception, asyncio.CancelledError) as exception:  # noqa: BLE001
+                return exception
 
         return await tqdm_asyncio.gather(*map(wrap, fs), **kwargs)
 
@@ -243,6 +282,8 @@ class AsyncBatchRunner:
         args_list: list[dict[str, Any]],
         task_ids: list[str],
         progress_bar_desc: str | None = None,
+        *,
+        raise_on_failure: bool = False,
     ) -> list[T | BaseException]:
         """
         Apply one async callable to multiple argument sets concurrently.
@@ -252,12 +293,19 @@ class AsyncBatchRunner:
         :param task_ids: Task identifiers corresponding to ``args_list``.
         :param progress_bar_desc: Progress-bar description, or ``None`` to disable the
             progress bar.
+        :param raise_on_failure: Stop queued calls after the first task exception, wait
+            for active calls to finish, and then raise that exception.
         :return: Results or exceptions in the same order as ``args_list``.
         :raises ValueError: If the number of task IDs does not match the number of
             argument sets.
         """
         funcs_with_args = [{"func": func, **args} for args in args_list]
-        return await self.gather(funcs_with_args, task_ids, progress_bar_desc)
+        return await self.gather(
+            funcs_with_args,
+            task_ids,
+            progress_bar_desc,
+            raise_on_failure=raise_on_failure,
+        )
 
     @property
     def num_active_count(self) -> int:
