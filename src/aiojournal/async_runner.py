@@ -6,7 +6,7 @@ import asyncio
 import csv
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from tqdm.asyncio import tqdm_asyncio
@@ -183,8 +183,8 @@ class AsyncBatchRunner:
             return
 
         # Format timestamps
-        start_time_str = datetime.fromtimestamp(start_time, tz=UTC).isoformat()
-        end_time_str = datetime.fromtimestamp(end_time, tz=UTC).isoformat()
+        start_time_str = datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat()
+        end_time_str = datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat()
         duration = end_time - start_time
 
         # Ensure only one task writes to the CSV at a time

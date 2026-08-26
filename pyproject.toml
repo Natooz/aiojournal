@@ -44,7 +44,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ty.environment]
-python-version = "3.13"
+python-version = "3.10"
 python-platform = "all"
 root = ["./src"]
 
@@ -60,7 +60,7 @@ unused-ignore-comment = "error"
 unused-type-ignore-comment = "error"
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py310"
 extend-exclude = ["**/*.parquet"]
 
 [tool.ruff.lint]
