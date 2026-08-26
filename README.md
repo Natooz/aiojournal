@@ -2,8 +2,8 @@
 
 An asynchronous batch execution runner with results persistence and resumability.
 
-Especially useful when making concurrent API calls and directly save each request's result.
-For example when benchmarking LLM models, from big providers or inference engines.
+Especially useful when making concurrent API calls while directly saving each request's result, for example when benchmarking LLM models, from big providers or inference engines.
+It is minimal and lightweight, only dependency is [tqdm](https://github.com/tqdm/tqdm).
 
 ```bash
 pip install aiojournal
