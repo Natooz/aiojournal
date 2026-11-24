@@ -53,7 +53,7 @@ include = ["src", "tests"]
 
 [tool.ty.rules]
 blanket-ignore-comment = "error"
-ignore-comment-unknown-rule = "error"
+unknown-rule-in-ignore-comment = "error"
 missing-type-argument = "error"
 possibly-unresolved-reference = "warn"
 unused-ignore-comment = "error"
