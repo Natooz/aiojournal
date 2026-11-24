@@ -1,6 +1,6 @@
 # aiojournal
 
-An asynchronous batch execution runner with results persistence and resumability.
+An asynchronous coroutine execution runner with concurrency control and results persistence and resumability.
 
 Especially useful when making concurrent API calls while directly saving each request's result, for example when benchmarking LLMs through API or inference engines.
 It is minimal and lightweight, only dependency is [tqdm](https://github.com/tqdm/tqdm).
@@ -18,6 +18,7 @@ from pathlib import Path
 from aiojournal import AsyncBatchRunner
 
 
+# Coroutine to run, dict maps csv column names to their content
 async def describe(value: int) -> dict[str, int | str]:
     await asyncio.sleep(0.1)
     return {
@@ -27,6 +28,7 @@ async def describe(value: int) -> dict[str, int | str]:
     }
 
 
+# Running coroutines, 2 simultaneously
 async def main() -> None:
     runner = AsyncBatchRunner(
         max_concurrency=2,
@@ -35,7 +37,7 @@ async def main() -> None:
     results = await runner.map(
         describe,
         args_list=[{"value": 1}, {"value": 2}, {"value": 3}],
-        task_ids=["one", "two", "three"],
+        task_ids=["one", "two", "thr"],
     )
     # {"result": 2, "input": 1, "parity": "odd"}
     # {"result": 4, "input": 2, "parity": "even"}
@@ -45,11 +47,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-
-Each task appends a row to `tasks.csv`. The journal can be read without loading the whole file:
+Each task appends a row to the `tasks.csv` output file, which can be read without loading the whole file:
 
 ```python
-for result in runner.read_results_csv():
+for result in runner.read_results_csv():  # generator
     print(result["task_id"], result["success"], result["result"])
 ```
 
