@@ -334,9 +334,9 @@ class AsyncBatchRunner:
                     _first_task_exception_future.set_result(exception)
                 error_msg = str(exception)
                 logger.info(
-                    f"{task_id} - Task failed: {error_msg}",
+                    _ := f"{task_id} - Task failed: {error_msg}",
                     extra={"task_id": task_id, "error": error_msg},
-                    exc_info=True
+                    exc_info=True,
                 )
                 raise
 
