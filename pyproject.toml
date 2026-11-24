@@ -1,6 +1,6 @@
 [project]
 name = "aiojournal"
-version = "0.0.1"
+version = "0.0.2"
 description = "Simple runner to perform batches of asynchronous tasks."
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {file = "LICENSE"}
