@@ -2,7 +2,7 @@
 
 An asynchronous batch execution runner with results persistence and resumability.
 
-Especially useful when making concurrent API calls while directly saving each request's result, for example when benchmarking LLM models, from big providers or inference engines.
+Especially useful when making concurrent API calls while directly saving each request's result, for example when benchmarking LLMs through API or inference engines.
 It is minimal and lightweight, only dependency is [tqdm](https://github.com/tqdm/tqdm).
 
 ```bash
